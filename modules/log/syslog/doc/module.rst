@@ -8,7 +8,7 @@ Syslog logging `log/syslog`
 Description
 ^^^^^^^^^^^
 
-This module wil output all log messages to `syslog`
+This module will output all log messages to `syslog`
 
 By default, the message are send to the facility local0. You can adjust your
 syslogd.conf accordingly.
