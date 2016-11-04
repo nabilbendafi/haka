@@ -9,12 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <gammu/gammu.h>
 #include <unistd.h>
+
+#include <gammu/gammu.h>
 
 #define BODY_SIZE	2048
 
 static REGISTER_LOG_SECTION(sms);
+GSM_StateMachine *state_machine;
 
 struct sms {
 	char *body;
@@ -24,10 +26,9 @@ struct sms {
 struct sms_alerter {
 	struct alerter_module module;
 	char *port;
+	char *pin;
 	char *recipients;
 };
-
-struct sms sms_ctx;
 
 static int init(struct parameters *args)
 {
@@ -39,24 +40,105 @@ static void cleanup()
 	;
 }
 
+/* Function to handle errors */
+static bool error_handler(GSM_Error error)
+{
+	if (error != ERR_NONE) {
+		LOG_ERROR(sms, "%s\n", GSM_ErrorString(error));
+		if (GSM_IsConnected(state_machine))
+			GSM_TerminateConnection(state_machine);
+		return true;
+	}
+}
+
 static bool send_sms(struct sms_alerter *state, uint64 id, const struct time *time, const struct alert *alert, bool update)
 {
+	GSM_SMSMessage sms;
+	GSM_Debug_Info *debug_info;
+	GSM_Error error;
+	int return_value = 0;
+
+	struct sms_alerter *alerter = (struct sms_alerter *)state;
+
 	if (0) {
 		LOG_ERROR(sms, "sms failed\n");
 		return false;
 	}
+
+	GSM_InitLocales(NULL);
 
 	/* Message body */
 	char body[BODY_SIZE];
 	snprintf(body, BODY_SIZE, "Subject: [Haka] alert: %s%s\r\n",
 		update ? "update " : "", alert_tostring(id, time, alert, "", " ", false));
 
-	if (getlevel("sms") == HAKA_LOG_DEBUG)
-		;
+	if (getlevel("sms") == HAKA_LOG_DEBUG) {
+		/* Enable global debugging */
+		debug_info = GSM_GetGlobalDebug();
+		GSM_SetDebugFileDescriptor(stderr, TRUE, debug_info);
+		GSM_SetDebugLevel("textall", debug_info);
+	}
 
-	/* Send the message */
+	/* Allocates state machine */
+	state_machine = GSM_AllocStateMachine();
+	if (state_machine == NULL)
+		return false;
 
-	/* Check for errors */
+	/* We have one valid configuration */
+	GSM_SetConfigNum(state_machine, 1);
+
+	/* Connect to phone */
+	error = GSM_InitConnection(state_machine, 1);
+	if (error_handler(error))
+		return false;
+
+	/* Prepare message */
+	/* Cleanup the structure */
+	memset(&sms, 0, sizeof(sms));
+	/* Encode message text */
+	EncodeUnicode(sms.Text, body, strlen(body));
+	/* We want to submit message */
+	sms.PDU = SMS_Submit;
+	/* No UDH, just a plain message */
+	sms.UDH.Type = UDH_NoUDH;
+	/* We used default coding for text */
+	sms.Coding = SMS_Coding_Default_No_Compression;
+	/* Class 1 message (normal) */
+	sms.Class = 1;
+	
+	char *recipient;
+	while ((recipient = strtok((char *)alerter->recipients, ",")) != NULL) {
+		/* Encode recipient number */
+		EncodeUnicode(sms.Number, recipient, strlen(recipient));
+
+		/* Send the message */
+		error = GSM_SendSMS(state_machine, &sms);
+		if (error_handler(error))
+			return false;
+
+		/* Wait for network reply */
+		while (!gshutdown) {
+			GSM_ReadDevice(state_machine, TRUE);
+			if (sms_send_status == ERR_NONE) {
+				/* Message sent OK */
+				return_value = 0;
+				break;
+			}
+			if (sms_send_status != ERR_TIMEOUT) {
+				/* Message sending failed */
+				return_value = 100;
+				break;
+			}
+		}
+	}
+
+	/* Terminate connection */
+	error = GSM_TerminateConnection(state_machine);
+	if (error_handler(error))
+		return false;
+
+	/* Free up used memory */
+	GSM_FreeStateMachine(state_machine);
 
 	return true;
 }
@@ -84,9 +166,9 @@ struct alerter_module *init_alerter(struct parameters *args)
 
 	/* Mandatory fields: device port, recipient phone number*/
 	const char *port = parameters_get_string(args, "port", NULL);
+	const char *pin = parameters_get_string(args, "pin", NULL);
 	const char *recipients = parameters_get_string(args, "recipient", NULL);
-	//const char *pin = parameters_get_string(args, "pin", NULL);
-	//const char *connection = "at";
+	//const char *connection = "at"; /* Only 'at' supported, yet !*/
 
 	if (!port || !recipients) {
 		error("missing mandatory field");
@@ -94,15 +176,16 @@ struct alerter_module *init_alerter(struct parameters *args)
 		return NULL;
 	}
 
-	char *recipient;
-	while ((recipient = strtok((char *)recipients, ",")) != NULL)
-		sms_alerter->recipients = recipient;
+	sms_alerter->port = strdup(port);
+	sms_alerter->recipients = strdup(recipients);
 
 	if (!sms_alerter->port || !sms_alerter->recipients) {
 		error("memory error");
 		free(sms_alerter);
 		return NULL;
 	}
+
+	sms_alerter->pin = strdup(pin);
 
 	return &sms_alerter->module;
 }
